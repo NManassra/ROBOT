@@ -1,0 +1,221 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <MPU6050.h>  // Include MPU6050 library
+
+#define ENA 32  
+#define ENB 33  
+#define IN1 25  
+#define IN2 26  
+#define IN3 27  
+#define IN4 14  
+
+#define XSHUT_1 4   
+#define XSHUT_2 16  
+
+#define TRIG_PIN 17
+#define ECHO_PIN 19
+
+#define SENSOR_THRESHOLD 50  // 5 cm for LiDAR sensors
+#define SENSOR_THRESHOLD_ULTRASONIC 50  // 5 cm for Ultrasonic sensor
+
+VL53L0X sensor1, sensor2;
+MPU6050 mpu;
+
+#define ENCODER_L 2  
+#define ENCODER_R 15 
+volatile int ticks_L = 0; 
+volatile int ticks_R = 0;
+
+#define TPR 600   
+#define WHEEL_DIAMETER 3 
+
+#define BASE_SPEED 55      
+#define ERROR_CORRECTION 5 
+
+void IRAM_ATTR countTicks_L() { ticks_L++; } 
+void IRAM_ATTR countTicks_R() { ticks_R++; } 
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(21, 22);
+
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+    pinMode(ENA, OUTPUT);
+    pinMode(ENB, OUTPUT);
+
+    pinMode(ENCODER_L, INPUT_PULLUP);
+    pinMode(ENCODER_R, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_L), countTicks_L, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_R), countTicks_R, RISING);
+
+    pinMode(XSHUT_1, OUTPUT);
+    pinMode(XSHUT_2, OUTPUT);
+
+    digitalWrite(XSHUT_1, LOW);
+    digitalWrite(XSHUT_2, LOW);
+    delay(10);
+
+    digitalWrite(XSHUT_1, HIGH);
+    delay(10);
+    sensor1.init();
+    sensor1.setAddress(0x30);
+
+    digitalWrite(XSHUT_2, HIGH);
+    delay(10);
+    sensor2.init();
+    sensor2.setAddress(0x31);
+
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    // Initialize MPU6050
+    mpu.initialize();
+    if (!mpu.testConnection()) {
+        Serial.println("MPU6050 connection failed!");
+        while (1);
+    }
+
+    Serial.println("Motors and Sensors Initialized");
+}
+
+// Function to measure distance using ultrasonic sensor
+long getUltrasonicDistance() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH);
+    long distance = duration * 0.034 / 2;  // Convert to mm
+    return distance;
+}
+
+// Function to move forward
+void moveForward(int speed_L, int speed_R) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENA, speed_R);
+    analogWrite(ENB, speed_L);
+}
+
+// Function to move backward
+void moveBackward(int speed_L, int speed_R) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENA, speed_R);
+    analogWrite(ENB, speed_L);
+}
+
+// Function to turn left using MPU6050
+void moveLeft(int speed_R) {
+    int16_t gx, gy, gz;
+    int targetAngle = 90;  // 90-degree turn
+    int currentAngle = 0;
+    
+    mpu.getRotation(&gx, &gy, &gz);
+    
+    while (currentAngle < targetAngle) {
+        digitalWrite(IN1, HIGH);  // Right motor moves forward
+        digitalWrite(IN2, LOW);
+        digitalWrite(IN3, HIGH);  // Left motor moves backward
+        digitalWrite(IN4, LOW);
+        analogWrite(ENA, speed_R);
+        analogWrite(ENB, speed_R);
+
+        mpu.getRotation(&gx, &gy, &gz);
+        currentAngle += gz * 0.01;  // Convert rotation rate to angle
+        delay(10);  // Small delay for accuracy
+    }
+
+    stopMotors();  // Stop after 90-degree turn
+}
+
+// Function to turn right using MPU6050
+void moveRight(int speed_L) {
+    int16_t gx, gy, gz;
+    int targetAngle = 90;
+    int currentAngle = 0;
+
+    mpu.getRotation(&gx, &gy, &gz);
+
+    while (currentAngle < targetAngle) {
+        digitalWrite(IN1, LOW);  // Right motor moves backward
+        digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, LOW);  // Left motor moves forward
+        digitalWrite(IN4, HIGH);
+        analogWrite(ENA, speed_L);
+        analogWrite(ENB, speed_L);
+
+        mpu.getRotation(&gx, &gy, &gz);
+        currentAngle += abs(gz) * 0.01;
+        delay(10);
+    }
+
+    stopMotors(); // Stop after turning 90 degrees
+}
+
+// Function to stop motors
+void stopMotors() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+}
+
+void loop() {
+    int speed_L = BASE_SPEED;
+    int speed_R = BASE_SPEED;
+
+    // Calculate tick error
+    int error = ticks_L - ticks_R;
+
+    // Apply proportional correction based on error
+    if (error > 0) {
+        speed_L -= ERROR_CORRECTION; // Slow down left motor slightly
+    } else if (error < 0) {
+        speed_R -= ERROR_CORRECTION; // Slow down right motor slightly
+    }
+
+    // Constrain speeds between 0 and 255
+    speed_L = constrain(speed_L, 0, 255);
+    speed_R = constrain(speed_R, 0, 255);
+
+    // Read sensor values
+    int distance1 = sensor1.readRangeSingleMillimeters();
+    int distance2 = sensor2.readRangeSingleMillimeters();
+    int ultrasonicDistance = getUltrasonicDistance();
+
+    Serial.print("Front LiDAR: ");
+    Serial.print(distance1);
+    Serial.print(" mm | Side LiDAR: ");
+    Serial.print(distance2);
+    Serial.print(" mm | Ultrasonic: ");
+    Serial.print(ultrasonicDistance);
+    Serial.println(" mm");
+
+    // Check if any sensor detects an obstacle within 5 cm (50 mm)
+    if (distance1 <= SENSOR_THRESHOLD || distance2 <= SENSOR_THRESHOLD || ultrasonicDistance <= SENSOR_THRESHOLD_ULTRASONIC) { 
+        Serial.println("Obstacle too close! Moving backward...");
+        moveBackward(speed_L, speed_R);
+    } else {
+        Serial.println("Path clear! Moving forward...");
+        moveForward(speed_L, speed_R);
+    }
+
+    Serial.print("Ticks L: "); Serial.print(ticks_L);
+    Serial.print(" | Ticks R: "); Serial.print(ticks_R);
+    Serial.print(" | Error: "); Serial.println(error);
+
+    delay(200);
+}
